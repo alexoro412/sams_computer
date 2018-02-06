@@ -2,18 +2,20 @@
 import Data.Word
 import System.IO
 import System.Environment
-import Data.Map () -- hiding (foldl, map, foldr, filter)
 import qualified Data.Map as M
 import Data.Maybe (fromMaybe, listToMaybe)
-import Data.List (sortBy)
+import Data.List (sortBy, intercalate)
 import Data.Bits
 import Numeric (showHex)
 import System.Exit (exitFailure)
 import Control.Monad (when)
 import Data.Char (chr)
 
+-- Representation for parsed program
+
 type Address = String 
 
+-- Consider adding a spot for line numbers here
 data Expr = Let Address Int 
     | Label Address 
     | Load Address 
@@ -24,14 +26,18 @@ data Expr = Let Address Int
     | Store Address
     | Halt deriving Show
 
+-- Intermediate representation
+-- Used immediately before compilation
+
 type CAddress = Word8
 
 data CExpr = CExpr Op Word8 deriving Show 
 
 data Op = CHalt | CLoad | CSub | CAdd | CGoto | CBN | CStore | CLet deriving Show
 
-parse :: String -> Expr 
-parse = _parse . words 
+-- Parses each line into an Expr
+parse :: (Int, String) -> Expr 
+parse (lineno, s) = _parse $ words s
     where _parse ["let", a, b] = Let a (read b)
           _parse ["load", a] = Load a 
           _parse ["sub", a] = Sub a 
@@ -41,6 +47,7 @@ parse = _parse . words
           _parse ["halt"] = Halt 
           _parse ["bn", a] = BN a
           _parse ["store", a] = Store a
+          _parse u = errorWithoutStackTrace $ red "[Error] " ++ show lineno ++ " `" ++ bold (unwords u) ++ "` could not be parsed."
 
 addresses :: [Word8]
 addresses = [minBound .. maxBound]
@@ -64,8 +71,8 @@ setAddresses exprs varBindings labelBindings = map fix exprs
           fix (Goto label) = CExpr CGoto $ findLabel label
           fix (BN label) = CExpr CBN $ findLabel label 
           fix Halt = CExpr CHalt 0
-          findVar var = fromMaybe (error $ "let " ++ var ++ " not found") (M.lookup var varBindings)
-          findLabel label = fromMaybe (error $ "label " ++ label ++ " not found") (M.lookup label labelBindings)
+          findVar var = fromMaybe (errorWithoutStackTrace $ red "[Error] " ++ "var " ++ bold var ++ " not found") (M.lookup var varBindings)
+          findLabel label = fromMaybe (errorWithoutStackTrace $ red "[Error] " ++ "label " ++ bold label ++ " not found") (M.lookup label labelBindings)
 
 _opcode :: Op -> Word8 
 _opcode CLet = 0
@@ -123,7 +130,7 @@ main = do
         contents <- hGetContents handle
         let lns = map unwords . filter (/= []) . map words $ lines contents 
             -- Remove variable declarations
-            (noVars, varValues_Int) = varReduce $ map parse lns
+            (noVars, varValues_Int) = varReduce . map parse $ zip [1..] lns
             -- Convert [Int] to [Word8]
             varValues = M.map fromIntegral varValues_Int
 
@@ -137,7 +144,7 @@ main = do
             -- Generate a map of variable name -> CAddress 
             varBindings = M.fromList varAddresses
             -- Generate CExpr list with vars at their addresses
-            varCode = map (\(name, _) -> CExpr CLet . fromMaybe (error "woah") $ M.lookup name varValues) varAddresses
+            varCode = map (\(name, _) -> CExpr CLet . fromMaybe (error "Ok this really shouln't happen. Like, at all.") $ M.lookup name varValues) varAddresses
 
             -- Remove labels, generate map from label name -> CAddress 
             (_, noLabels, labelBindings) = labelReduce numVars noVars
@@ -148,9 +155,9 @@ main = do
             !hex = map (padZero . (`showHex` "") . assembleCExpr) (varCode ++ withAddresses)
 
         -- Warn when program is too long
-        when (length withAddresses > 256) $ do
+        when (length withAddresses > 32) $ do
              putStrLn $ red "[Warning]" ++ " Program takes up too much space"
-             putStrLn $     "          Maximum space is " ++ bold "256" ++ " bytes"
+             putStrLn $     "          Maximum space is " ++ bold "32" ++ " bytes"
              putStrLn $     "          Program uses " ++ bold (show $ length withAddresses) ++ " bytes"
         return $ unwords hex)
 
