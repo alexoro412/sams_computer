@@ -1,14 +1,14 @@
-
+{-# LANGUAGE BangPatterns #-}
 import Data.Word
 import System.IO
 import System.Environment
 import Data.Map hiding (foldl, map, foldr)
 import qualified Data.Map as M
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.List (sortBy)
 import Data.Bits
-import Numeric (showHex, showIntAtBase)
-import Data.Char (intToDigit)
+import Numeric (showHex)
+import System.Exit (exitFailure)
 
 type Address = String 
 
@@ -24,14 +24,9 @@ data Expr = Let Address Word8
 
 type CAddress = Word8
 
-data CExpr = CLet Word8 
-    | CLoad CAddress 
-    | CSub CAddress 
-    | CAdd CAddress 
-    | CGoto CAddress 
-    | CBN CAddress 
-    | CStore CAddress
-    | CHalt deriving Show
+data CExpr = CExpr Op Word8 deriving Show 
+
+data Op = CHalt | CLoad | CSub | CAdd | CGoto | CBN | CStore | CLet deriving Show
 
 parse :: String -> Expr 
 parse = _parse . words 
@@ -46,7 +41,7 @@ parse = _parse . words
           _parse ["store", a] = Store a
 
 addresses :: [Word8]
-addresses = [minBound, maxBound]
+addresses = [minBound .. maxBound]
 
 varReduce :: [Expr] -> ([Expr], Map Address Word8)
 varReduce = foldr (\expr (exprs, bindings) -> case expr of 
@@ -60,60 +55,85 @@ labelReduce offset = foldl (\(i, exprs, bindings) expr -> case expr of
 
 setAddresses :: [Expr] -> Map Address Word8 -> Map Address Word8 -> [CExpr]
 setAddresses exprs varBindings labelBindings = map fix exprs 
-    where fix (Sub var) = CSub $ findVar var
-          fix (Add var) = CAdd $ findVar var 
-          fix (Load var) = CLoad $ findVar var
-          fix (Store var) = CStore $ findVar var 
-          fix (Goto label) = CGoto $ findLabel label
-          fix (BN label) = CBN $ findLabel label 
-          fix Halt = CHalt 
+    where fix (Sub var) = CExpr CSub $ findVar var
+          fix (Add var) = CExpr CAdd $ findVar var 
+          fix (Load var) = CExpr CLoad $ findVar var
+          fix (Store var) = CExpr CStore $ findVar var 
+          fix (Goto label) = CExpr CGoto $ findLabel label
+          fix (BN label) = CExpr CBN $ findLabel label 
+          fix Halt = CExpr CHalt 0
           findVar var = fromMaybe (error $ "let " ++ var ++ " not found") (M.lookup var varBindings)
           findLabel label = fromMaybe (error $ "label " ++ label ++ " not found") (M.lookup label labelBindings)
 
-_opcode :: CExpr -> Word8 
--- _opcode (CLet _) = 0
-_opcode (CLoad _) = 0
-_opcode (CSub _) = 1
-_opcode (CAdd _) = 2
-_opcode (CGoto _) = 3
-_opcode (CBN _) = 4
-_opcode (CStore _) = 6
+_opcode :: Op -> Word8 
+_opcode CLet = 0
+_opcode CLoad = 9
+_opcode CSub = 1
+_opcode CAdd = 2
+_opcode CGoto = 3
+_opcode CBN = 4
+_opcode CStore = 6
 _opcode CHalt = 7
 
-opcode :: CExpr -> Word8 
+opcode :: Op -> Word8 
 opcode e = shift (_opcode e) 5
 
+clamp :: Word8 -> Word8 
+clamp = min 31 
+
 assembleCExpr :: CExpr -> Word8 
-assembleCExpr (CLet x) = x
-assembleCExpr CHalt = opcode CHalt 
-assembleCExpr a@(CLoad x) = opcode a .|. x
-assembleCExpr a@(CAdd x) = opcode a .|. x
-assembleCExpr a@(CSub x) = opcode a .|. x
-assembleCExpr a@(CGoto x) = opcode a .|. x
-assembleCExpr a@(CBN x) = opcode a .|. x
-assembleCExpr a@(CStore x) = opcode a .|. x
+assembleCExpr (CExpr e x) = opcode e .|. clamp x
 
 padZero :: String -> String 
 padZero [c] = '0':[c]
 padZero cs = cs
 
+safeHead :: [a] -> Maybe a
+safeHead (x:_) = Just x 
+safeHead [] = Nothing
+
 main :: IO () 
 main = do
-    [fname] <- getArgs 
-    withFile fname ReadMode (\handle -> do
+    -- Argument Parsing
+    args <- getArgs 
+    (fname, output) <- case listToMaybe args of 
+        -- If filename provided, check for output 
+        -- If no output, use "a.out"
+        Just fname -> let (_:args2) = args in return (fname, fromMaybe "a.out" $ listToMaybe args2) 
+        -- No filename, so print usage and exit
+        Nothing -> do
+            putStrLn "Error: No filename provided"
+            putStrLn "Usage: assembler <fname> [<output>]"
+            exitFailure 
+    
+
+    hex <- withFile fname ReadMode (\handle -> do
         contents <- hGetContents handle
         let lns = lines contents 
-            (res, varValues) = varReduce $ map parse lns
+            -- Remove variable declarations
+            (noVars, varValues) = varReduce $ map parse lns
+            -- Count number of variables
             numVars = fromIntegral (length varValues)
-            varList = sortBy (\(_, n) (_, m) -> n `compare` m) $ zip (keys varValues) [0..]
-            -- varBindings = fromList $ zip (keys varValues) [1..]
-            varBindings = fromList varList
-            varCode = map (\(name, _) -> CLet . fromMaybe (error "woah") $ M.lookup name varValues) varList
+            -- Assign an address to each variable
+            varAddresses = sortBy (\(_, n) (_, m) -> n `compare` m) $ zip (keys varValues) addresses
+            -- Generate a map of variable name -> CAddress 
+            varBindings = fromList varAddresses
+            -- Generate CExpr list with vars at their addresses
+            varCode = map (\(name, _) -> CExpr CLet . fromMaybe (error "woah") $ M.lookup name varValues) varAddresses
 
-            (_, res2, labelBindings) = labelReduce numVars res
-            withAddresses = setAddresses res2 varBindings labelBindings
-            assembledCode = map assembleCExpr (varCode ++ withAddresses)
-            -- hex =map (padZero . (\x -> showIntAtBase 2 intToDigit x "")) assembledCode
-            hex = map (padZero . (`showHex` "")) assembledCode
-        putStrLn "v 2.1"
-        putStrLn $ unwords hex )
+            -- Remove labels, generate map from label name -> CAddress 
+            (_, noLabels, labelBindings) = labelReduce numVars noVars
+            -- insert proper CAddress's for each CExpr 
+            withAddresses = setAddresses noLabels varBindings labelBindings
+            -- Assemble code into hex
+            -- Strictness to allow file to be closed before next file written to
+            !hex = map (padZero . (`showHex` "") . assembleCExpr) (varCode ++ withAddresses)
+        return $ unwords hex)
+
+    -- Write output
+    writeFile output $ "v 2.1\n" ++ hex
+
+    -- YAY!
+    putStrLn $ "Output written to ./" ++ output
+                
+    
